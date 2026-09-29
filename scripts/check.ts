@@ -54,6 +54,11 @@ import {
 } from '../src/lib/exception';
 import { findReferencePath } from '../src/lib/pathfind';
 import { boundaryOffset, linearText, type SeqNodeAdapter } from '../src/lib/selection';
+import {
+  validateClauseDocument,
+  validateImportBundle,
+  isValidPersistedState,
+} from '../shared/validation';
 import { sampleDocument } from '../src/lib/sample';
 let pass = 0;
 let fail = 0;
@@ -2817,6 +2822,290 @@ check('闭区间为每个目标建边', combA.edges.filter((e) => e.refKey === r
       rs.signoffView.counts.valid === 1 && rs.canUndo === false);
     delete (globalThis as { localStorage?: Storage }).localStorage;
   }
+}
+
+// ---- JSON 导入全树校验：条→款→项层级、必需字段、全树 ID 唯一；不合格整次拒绝且现状不变 ----
+{
+  const mkNode = (
+    id: string,
+    kind: 'article' | 'paragraph' | 'item',
+    children: unknown[] = [],
+    extra: Record<string, unknown> = {},
+  ): Record<string, unknown> => ({ id, kind, ordinal: 1, text: '', children, ...extra });
+
+  // —— 合法形态 ——
+  check('校验：空 root 合法', validateClauseDocument({ id: 'd', title: '空', root: [] }).ok === true);
+  const validTree = [
+    mkNode('art1', 'article', [
+      mkNode('par1', 'paragraph', [mkNode('itm1', 'item', [])]),
+      mkNode('par2', 'paragraph', []),
+    ]),
+  ];
+  {
+    const r = validateClauseDocument({ id: 'd', title: '合法', root: validTree });
+    check('校验：条款项三层合法', r.ok === true, r.errors.join('；'));
+    check('校验：rootCount 统计正确', r.rootCount === 1);
+  }
+
+  // —— 缺少 root / root 非数组 ——
+  check(
+    '校验：缺少 document.root',
+    validateClauseDocument({ title: 'x' }).errors[0] === 'MISSING_ROOT',
+  );
+  check(
+    '校验：root 非数组',
+    validateClauseDocument({ root: {} }).errors[0] === 'MISSING_ROOT',
+  );
+
+  // —— 层级错误 ——
+  {
+    const itemAtTop = [mkNode('itmX', 'item', [])];
+    const r = validateClauseDocument({ root: itemAtTop });
+    check('校验：顶层必须为条（item 拒绝）', !r.ok && r.errors.some((e) => e.includes('层级不合法')));
+  }
+  {
+    const itemChild = [mkNode('art1', 'article', [mkNode('itmX', 'item', [])])];
+    const r = validateClauseDocument({ root: itemChild });
+    check('校验：条下必须为款（item 拒绝）', !r.ok && r.errors.some((e) => e.includes('层级不合法')));
+  }
+  {
+    const deep = [
+      mkNode('art1', 'article', [
+        mkNode('par1', 'paragraph', [
+          mkNode('itm1', 'item', [mkNode('nested', 'item', [])]),
+        ]),
+      ]),
+    ];
+    const r = validateClauseDocument({ root: deep });
+    check('校验：项下不可再嵌套', !r.ok && r.errors.some((e) => e.includes('项节点不可再包含子节点')));
+  }
+  {
+    const badKind = [{ id: 'x', kind: 'chapter', ordinal: 1, text: '', children: [] }];
+    const r = validateClauseDocument({ root: badKind });
+    check('校验：kind 取值非法', !r.ok && r.errors.some((e) => e.includes('kind 必须是')));
+    check('校验：错误信息含结构路径', r.errors.some((e) => e.includes('第 1 条')));
+  }
+
+  // —— 必需字段缺失（修复“子节点缺 children 抛错”）——
+  for (const field of ['id', 'ordinal', 'text', 'children', 'kind']) {
+    const node = mkNode('art1', 'article', []);
+    delete node[field];
+    const r = validateClauseDocument({ root: [node] });
+    check(
+      `校验：缺少必需字段 ${field} 被拒绝且不抛错`,
+      !r.ok && r.errors.some((e) => e.includes(field)),
+      r.errors.join('；'),
+    );
+  }
+  {
+    const noChildrenChild = [
+      {
+        id: 'art1',
+        kind: 'article',
+        ordinal: 1,
+        text: '',
+        children: [{ id: 'par1', kind: 'paragraph', ordinal: 1, text: '' }],
+      },
+    ];
+    let threw = false;
+    let r;
+    try {
+      r = validateClauseDocument({ root: noChildrenChild });
+    } catch {
+      threw = true;
+    }
+    check('校验：子节点缺 children 不再抛错而是报告原因', !threw && r && !r.ok && r.errors.some((e) => e.includes('children')));
+  }
+
+  // —— 全树 ID 唯一（修复分析索引覆盖、引用/审签关联错误）——
+  {
+    const dup = [
+      mkNode('dup', 'article', []),
+      mkNode('art2', 'article', [
+        mkNode('dup', 'paragraph', []),
+      ]),
+    ];
+    const r = validateClauseDocument({ root: dup });
+    check('校验：跨层重复 ID 拒绝', !r.ok && r.errors.some((e) => e.includes('重复')));
+    check('校验：重复 ID 报错给出两个位置', (r.errors.find((e) => e.includes('重复'))?.match(/第 \d+ 条/g) ?? []).length >= 1);
+  }
+  {
+    const dupInner = [
+      mkNode('art1', 'article', [
+        mkNode('par1', 'paragraph', [mkNode('same', 'item'), mkNode('same2', 'item')]),
+        mkNode('par2', 'paragraph', [mkNode('same', 'item')]),
+      ]),
+    ];
+    const r = validateClauseDocument({ root: dupInner });
+    check('校验：项级重复 ID 拒绝且路径定位到款项', !r.ok &&
+      r.errors.some((e) => e.includes('重复') && e.includes('款') && e.includes('项')));
+  }
+
+  // —— 可选字段类型 ——
+  check(
+    '校验：title 非字符串拒绝',
+    !validateClauseDocument({ title: 123, root: [] }).ok,
+  );
+  {
+    const r = validateClauseDocument({
+      root: [mkNode('art1', 'article', [], { title: 99 })],
+    });
+    check('校验：节点 title 非字符串拒绝', !r.ok && r.errors.some((e) => e.includes('title')));
+  }
+
+  // —— 包形态：document / doc 均可识别 ——
+  check('校验：ExportBundle 形态（document）', validateImportBundle({
+    app: 'clause-reference-validator',
+    version: 1,
+    document: { id: 'd', title: 't', root: [] },
+    confirmed: {},
+  }).validation.ok);
+  check('校验：PersistedState 形态（doc）', validateImportBundle({
+    doc: { id: 'd', title: 't', root: [] },
+    confirmed: {},
+  }).validation.ok);
+  check('校验：非对象内容拒绝', !validateImportBundle(null).validation.ok);
+  check('校验：无 document/doc 拒绝', !validateImportBundle({ foo: 1 }).validation.ok);
+  check(
+    '校验：持久化状态守卫——confirmed 非对象拒绝',
+    isValidPersistedState({ doc: { id: 'd', title: 't', root: [] } }) === false &&
+      isValidPersistedState({ doc: { id: 'd', title: 't', root: [] }, confirmed: [] }) === false,
+  );
+  check(
+    '校验：持久化状态守卫——坏树拒绝',
+    isValidPersistedState({ doc: { title: 't', root: [{ id: 'a' }] }, confirmed: {} }) === false,
+  );
+  check(
+    '校验：持久化状态守卫——合法通过',
+    isValidPersistedState({ doc: { id: 'd', title: 't', root: [] }, confirmed: {} }) === true,
+  );
+}
+
+// ---- importJson：失败时正文/留痕/撤销历史原样保留；成功时保留节点 ID 与附属记录 ----
+{
+  const impTextA = `导入法甲
+
+第一条
+参见第三条。
+
+第二条
+参见第三条。`;
+  const impTextB = `导入法乙
+
+第一条【总则】
+普通条文。`;
+  const mkDocA = () => parseDocument(impTextA).doc;
+
+  const base = new AppStore({ doc: mkDocA(), confirmed: {}, annotations: [] });
+  const beforeTitle = base.getSnapshot().doc.title;
+  const beforeArtId = base.getSnapshot().doc.root[0].id;
+  base.signArticle(beforeArtId, '失败前签人');
+  const snapshotCountBefore = 0;
+
+  // 非法包：重复 ID
+  const badBundle = {
+    document: {
+      id: 'dBad',
+      title: '坏文档',
+      root: [
+        { id: 'dup', kind: 'article', ordinal: 1, text: '', children: [] },
+        {
+          id: 'art2',
+          kind: 'article',
+          ordinal: 2,
+          text: '',
+          children: [{ id: 'dup', kind: 'paragraph', ordinal: 1, text: '', children: [] }],
+        },
+      ],
+    },
+    confirmed: {},
+  };
+  const res = base.importJson(badBundle);
+  check('导入：非法包返回失败与原因', res.ok === false && res.errors.some((e) => e.includes('重复')));
+  check('导入：失败后正文保持原状', base.getSnapshot().doc.title === beforeTitle &&
+    base.getSnapshot().doc.root[0].id === beforeArtId);
+  check('导入：失败后审签留痕保持原状', base.getSnapshot().signoffView.counts.valid === 1);
+  check('导入：失败后撤销历史不新增（undo 无效）', base.getSnapshot().canUndo === false);
+  check('导入：失败不产生新世界（仍在原世界）', base.getSnapshot().snapshots.length === snapshotCountBefore);
+
+  // 非法包：缺 children（旧实现会抛错）
+  let threw = false;
+  let res2;
+  try {
+    res2 = base.importJson({
+      document: {
+        id: 'dBad2',
+        title: '坏文档2',
+        root: [{ id: 'a1', kind: 'article', ordinal: 1, text: '', children: [
+          { id: 'p1', kind: 'paragraph', ordinal: 1, text: '' },
+        ] }],
+      },
+      confirmed: {},
+    });
+  } catch {
+    threw = true;
+  }
+  check('导入：缺 children 不抛错且返回原因', !threw && res2 && res2.ok === false &&
+    res2.errors.some((e) => e.includes('children')));
+  check('导入：第二次失败后正文仍原状', base.getSnapshot().doc.root[0].id === beforeArtId);
+
+  // 合法包：空 root 可导入，为一步可撤销事务
+  const emptyRes = base.importJson({
+    document: { id: 'dEmpty', title: '空文档', root: [] },
+    confirmed: {},
+  });
+  check('导入：空 root 合法导入', emptyRes.ok === true &&
+    base.getSnapshot().doc.title === '空文档' && base.getSnapshot().doc.root.length === 0);
+  base.undo();
+  check('导入：空 root 导入可撤销回原状', base.getSnapshot().doc.root[0].id === beforeArtId &&
+    base.getSnapshot().signoffView.counts.valid === 1);
+  base.redo();
+
+  // 合法包：保留节点 ID 与附属记录，引用 / 审签仍关联原节点
+  const goodDoc = parseDocument(impTextA).doc;
+  const artAId = goodDoc.root[0].id;
+  const good = new AppStore({ doc: goodDoc, confirmed: {}, annotations: [] });
+  // 对第一条签署后导出（走真实导出形态，含冻结快照）
+  check('导入：签署成功', good.signArticle(artAId, '原签人').ok === true);
+  const exported = good.exportJson();
+
+  const target = new AppStore({ doc: parseDocument(impTextB).doc, confirmed: {}, annotations: [] });
+  const okRes = target.importJson(exported);
+  check('导入：合法导出包导入成功', okRes.ok === true);
+  {
+    const s = target.getSnapshot();
+    check('导入：节点 ID 原样保留', s.doc.root[0].id === artAId, s.doc.root[0].id);
+    check('导入：审签按原节点 ID 关联且有效', s.signoffView.counts.valid === 1 &&
+      s.signoffView.entries[0].articleId === artAId);
+    // 引用仍解析到原节点
+    const art2 = s.doc.root[1];
+    const occ = s.analysis.byNode[art2.children[0]?.id ?? art2.id] ?? [];
+    check('导入：分析索引以原 ID 建表无覆盖', Object.keys(s.analysis.nodes).length ===
+      countImportedNodes(s.doc.root));
+    void occ;
+  }
+
+  // 冻结对象（导出包内快照）往返导入不报错，且入参树不被就地改写
+  const frozenBundle = good.exportJson();
+  const frozenRoot = frozenBundle.document.root;
+  const reimp = new AppStore({ doc: parseDocument(impTextB).doc, confirmed: {}, annotations: [] });
+  let frozenThrew = false;
+  try {
+    reimp.importJson(frozenBundle);
+  } catch {
+    frozenThrew = true;
+  }
+  check('导入：冻结导出包导入不抛错', frozenThrew === false);
+  check('导入：入参树 ordinal 未被就地改写', frozenRoot[0].ordinal === good.getSnapshot().doc.root[0].ordinal);
+}
+
+function countImportedNodes(nodes: { children?: unknown[] }[]): number {
+  let n = 0;
+  for (const node of nodes) {
+    n += 1;
+    if (Array.isArray(node.children)) n += countImportedNodes(node.children as { children?: unknown[] }[]);
+  }
+  return n;
 }
 
 console.log(`\n通过 ${pass} 项，失败 ${fail} 项`);

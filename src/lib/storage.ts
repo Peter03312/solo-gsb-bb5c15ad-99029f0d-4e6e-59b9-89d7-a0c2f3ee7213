@@ -1,4 +1,5 @@
 import type { PersistedState } from '../../shared/model';
+import { isValidPersistedState } from '../../shared/validation';
 
 const LS_KEY = 'clause-reference-validator:v1';
 
@@ -9,7 +10,8 @@ export const localStore = {
       const raw = localStorage.getItem(LS_KEY);
       if (!raw) return null;
       const parsed = JSON.parse(raw) as PersistedState;
-      if (!parsed.doc || !Array.isArray(parsed.doc.root)) return null;
+      // 与服务端 PUT /api/state、页面 JSON 导入同一套全树校验：结构不合法的缓存不加载
+      if (!isValidPersistedState(parsed)) return null;
       return parsed;
     } catch {
       return null;

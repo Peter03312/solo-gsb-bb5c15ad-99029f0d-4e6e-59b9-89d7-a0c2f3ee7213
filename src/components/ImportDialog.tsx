@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import { useApp } from '../lib/context';
-import type { ExportBundle } from '../../shared/model';
+import { validateImportBundle } from '../../shared/validation';
 import { sampleDocument } from '../lib/sample';
 
 const PASTE_PLACEHOLDER = `示例法（节选）
@@ -34,17 +34,33 @@ export function ImportDialog({ onClose }: { onClose: () => void }) {
 
   const onFile = async (file: File) => {
     setError(null);
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(await file.text()) as ExportBundle;
-      if (!parsed.document || !Array.isArray(parsed.document.root)) {
-        setError('JSON 结构不合法：缺少 document.root');
-        return;
-      }
-      store.importJson(parsed);
-      onClose();
+      parsed = JSON.parse(await file.text());
     } catch (e) {
       setError(`JSON 解析失败：${(e as Error).message}`);
+      return;
     }
+    // 与 POST /api/validate 完全一致的全树校验：条 → 款 → 项层级、
+    // 必需字段、全树节点 ID 唯一。任一不合格都说明原因并整次拒绝，
+    // 不替换当前正文、不改动审阅留痕与撤销历史（弹窗保持打开，便于修正后重试）。
+    const { validation } = validateImportBundle(parsed);
+    if (!validation.ok) {
+      setError(
+        validation.errors[0] === 'MISSING_ROOT'
+          ? 'JSON 结构不合法：缺少 document.root（需为条款数组，空数组也可导入）'
+          : `JSON 结构不合法，已取消导入（当前文档未改动）：\n${validation.errors.join('\n')}`,
+      );
+      if (fileRef.current) fileRef.current.value = '';
+      return;
+    }
+    const result = store.importJson(parsed as Parameters<typeof store.importJson>[0]);
+    if (!result.ok) {
+      setError(`JSON 结构不合法，已取消导入（当前文档未改动）：\n${result.errors.join('\n')}`);
+      if (fileRef.current) fileRef.current.value = '';
+      return;
+    }
+    onClose();
   };
 
   return (

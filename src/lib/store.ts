@@ -63,6 +63,7 @@ import {
   scanTerms,
 } from './terminology';
 import type { TermHit, TermRule } from '../../shared/model';
+import { validateImportBundle } from '../../shared/validation';
 import { sampleTermRules } from './sample';
 import { uid } from './uid';
 
@@ -589,12 +590,24 @@ export class AppStore {
     );
   }
 
-  importJson(bundle: ExportBundle | PersistedState): void {
-    const rawDoc = 'document' in bundle ? bundle.document : bundle.doc;
+  /**
+   * JSON 导入：先做全树结构校验（条 → 款 → 项层级、必需字段、全树 ID 唯一），
+   * 任一节点不合格即整次拒绝——不提交事务，当前正文、审阅留痕（快照 / 基线 /
+   * 审签 / 例外 / 批注）与撤销历史全部保持原状，由调用方展示原因。
+   * 校验通过时原样保留全部节点 ID 与附属记录：引用、审签等按节点 ID 的关联
+   * 在导入后仍指向原节点。root 为空数组的合法文档同样允许导入。
+   */
+  importJson(bundle: ExportBundle | PersistedState): { ok: boolean; errors: string[] } {
+    const { validation, doc: validDoc } = validateImportBundle(bundle);
+    if (!validDoc) return { ok: false, errors: validation.errors };
+    // 克隆条款树后再重编号：导入包可能是冻结对象（导出包内快照即只读冻结），
+    // 且不应就地改写入参；克隆逐节点保留原 id，引用定位与审签关联不漂移
+    const root = cloneTree(validDoc.root);
+    renumberAll(root);
     const doc: ClauseDocument = {
-      id: rawDoc.id || uid('doc'),
-      title: typeof rawDoc.title === 'string' ? rawDoc.title : '未命名条款集',
-      root: Array.isArray(rawDoc.root) ? rawDoc.root : [],
+      id: validDoc.id || uid('doc'),
+      title: typeof validDoc.title === 'string' ? validDoc.title : '未命名条款集',
+      root,
       updatedAt: Date.now(),
     };
     const confirmed = bundle.confirmed ?? {};
@@ -610,12 +623,12 @@ export class AppStore {
     const signoffs = sanitizeSignoffs(bundle.signoffs);
     // 例外处置记录随 JSON 导入；旧文件缺少 issueExceptions 时按空列表加载，三态按导入正文实时重算
     const issueExceptions = sanitizeIssueExceptions(bundle.issueExceptions);
-    renumberAll(doc.root);
     // 导入包的整套状态作为新世界事务：撤销恢复导入前文档及其留痕，重做恢复导入后整套状态
     this.commitReplacement(
       { doc: touch(doc), confirmed, annotations, termRules },
       { snapshots, issueBaselines, signoffs, issueExceptions },
     );
+    return { ok: true, errors: [] };
   }
 
   exportJson(): ExportBundle {

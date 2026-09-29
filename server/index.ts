@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { ExportBundle, PersistedState } from '../shared/model';
+import type { PersistedState } from '../shared/model';
+import { validateImportBundle, isValidPersistedState } from '../shared/validation';
 
 // ESM 运行（tsx 开发 / esbuild 打包均为 ESM）
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -18,17 +19,12 @@ const DATA_FILE = path.join(DATA_DIR, 'state.json');
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-function isPersistedState(v: unknown): v is PersistedState {
-  if (!v || typeof v !== 'object') return false;
-  const doc = (v as PersistedState).doc;
-  return Boolean(doc && Array.isArray(doc.root) && typeof doc.title === 'string');
-}
-
 async function readState(): Promise<PersistedState | null> {
   try {
     const raw = await fsp.readFile(DATA_FILE, 'utf8');
     const parsed = JSON.parse(raw) as PersistedState;
-    return isPersistedState(parsed) ? parsed : null;
+    // 与 PUT /api/state 相同的全树校验：磁盘上结构不合法的文件不加载
+    return isValidPersistedState(parsed) ? parsed : null;
   } catch {
     return null;
   }
@@ -88,8 +84,8 @@ app.get('/api/state', async (_req, res) => {
 
 app.put('/api/state', async (req, res) => {
   const body = req.body as PersistedState;
-  if (!isPersistedState(body)) {
-    res.status(400).json({ error: '数据格式不合法：需要 { doc: { title, root }, confirmed }' });
+  if (!isValidPersistedState(body)) {
+    res.status(400).json({ error: '数据格式不合法：需要 { doc: { title, root }, confirmed }，且 root 需满足 条→款→项 层级、必需字段齐全、节点 ID 全树唯一' });
     return;
   }
   try {
@@ -101,12 +97,24 @@ app.put('/api/state', async (req, res) => {
 });
 
 app.post('/api/validate', (req, res) => {
-  const bundle = req.body as ExportBundle;
-  if (!bundle || !bundle.document || !Array.isArray(bundle.document.root)) {
-    res.status(400).json({ error: '导入文件缺少 document.root' });
+  // 与页面「选择 JSON 文件」导入共用同一套全树校验规则：
+  // document（导出包）或 doc（持久化状态）下的 root 必须是数组（空数组合法），
+  // 且每个节点满足 条 → 款 → 项 层级、必需字段齐全、节点 ID 全树唯一。
+  const bundle = req.body;
+  const { validation } = validateImportBundle(bundle);
+  if (!validation.ok) {
+    const detail =
+      validation.errors[0] === 'MISSING_ROOT'
+        ? '导入文件缺少 document.root'
+        : validation.errors.join('；');
+    res.status(400).json({ error: detail });
     return;
   }
-  res.json({ ok: true, title: bundle.document.title, rootCount: bundle.document.root.length });
+  const doc =
+    bundle && typeof bundle === 'object' && 'document' in bundle
+      ? (bundle as { document: { title?: unknown } }).document
+      : (bundle as { doc: { title?: unknown } }).doc;
+  res.json({ ok: true, title: typeof doc.title === 'string' ? doc.title : undefined, rootCount: validation.rootCount ?? 0 });
 });
 
 // 生产模式托管前端构建产物（dist-server/index.cjs → 同级 ../dist）
