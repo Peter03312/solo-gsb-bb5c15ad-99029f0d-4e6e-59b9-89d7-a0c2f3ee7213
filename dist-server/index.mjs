@@ -5,6 +5,134 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+// shared/validation.ts
+var KINDS = ["article", "paragraph", "item"];
+function err(errors, path2, message) {
+  errors.push({ path: path2, message });
+}
+function isPlainNode(v) {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+function validateClauseTree(root) {
+  const errors = [];
+  const counts = { articles: 0, paragraphs: 0, items: 0, nodes: 0 };
+  if (!Array.isArray(root)) {
+    err(errors, "document", "document.root \u5FC5\u987B\u662F\u6570\u7EC4");
+    return { ok: false, errors };
+  }
+  const seenIds = /* @__PURE__ */ new Map();
+  const walkLevel = (nodes, parentPath, depth) => {
+    const expectedKind = KINDS[depth];
+    nodes.forEach((rawNode, i) => {
+      const nodePath = `${parentPath}[${i}]`;
+      if (!isPlainNode(rawNode)) {
+        err(errors, nodePath, `\u8282\u70B9\u5FC5\u987B\u662F\u5BF9\u8C61\uFF0C\u5B9E\u9645\u4E3A ${rawNode === null ? "null" : typeof rawNode}`);
+        return;
+      }
+      const node = rawNode;
+      if (typeof node.id !== "string" || node.id.length === 0) {
+        err(errors, nodePath, "\u7F3A\u5C11\u5FC5\u9700\u5B57\u6BB5 id\uFF08\u5FC5\u987B\u662F\u975E\u7A7A\u5B57\u7B26\u4E32\uFF09\uFF0C\u8282\u70B9 ID \u662F\u5F15\u7528\u5B9A\u4F4D\u4E0E\u5BA1\u7B7E\u5173\u8054\u7684\u552F\u4E00\u952E");
+      } else {
+        const firstPath = seenIds.get(node.id);
+        if (firstPath) {
+          err(errors, nodePath, `\u8282\u70B9 ID\u300C${node.id}\u300D\u4E0E ${firstPath} \u91CD\u590D\uFF1A\u5168\u6811 ID \u5FC5\u987B\u552F\u4E00\uFF0C\u91CD\u590D ID \u4F1A\u4F7F\u5206\u6790\u7D22\u5F15\u8986\u76D6\u524D\u4E00\u8282\u70B9\u3001\u5F15\u7528\u4E0E\u5BA1\u7B7E\u5173\u8054\u9519\u8BEF`);
+        } else {
+          seenIds.set(node.id, nodePath);
+        }
+      }
+      if (typeof node.kind !== "string") {
+        err(errors, nodePath, `\u7F3A\u5C11\u5FC5\u9700\u5B57\u6BB5 kind\uFF08\u8BE5\u5C42\u5FC5\u987B\u4E3A\u300C${expectedKind}\u300D\uFF09`);
+      } else if (!KINDS.includes(node.kind)) {
+        err(errors, nodePath, `\u8282\u70B9 kind\u300C${node.kind}\u300D\u975E\u6CD5\uFF0C\u4EC5\u652F\u6301 article / paragraph / item`);
+      } else if (node.kind !== expectedKind) {
+        err(
+          errors,
+          nodePath,
+          `\u5C42\u7EA7\u7C7B\u578B\u9519\u8BEF\uFF1A${pathLabel(parentPath, i)}\u5E94\u4E3A\u300C${expectedKind}\u300D\uFF0C\u5B9E\u9645\u4E3A\u300C${node.kind}\u300D\uFF08\u6761 \u2192 \u6B3E \u2192 \u9879\u4E0D\u53EF\u9519\u4F4D\uFF09`
+        );
+      } else if (node.kind === "article") {
+        counts.articles += 1;
+      } else if (node.kind === "paragraph") {
+        counts.paragraphs += 1;
+      } else {
+        counts.items += 1;
+      }
+      counts.nodes += 1;
+      if (typeof node.text !== "string") {
+        err(errors, nodePath, '\u7F3A\u5C11\u5FC5\u9700\u5B57\u6BB5 text\uFF08\u5FC5\u987B\u662F\u5B57\u7B26\u4E32\uFF1B\u7A7A\u6B63\u6587\u53EF\u4E3A\u7A7A\u5B57\u7B26\u4E32 ""\uFF09');
+      }
+      if (node.title !== void 0 && typeof node.title !== "string") {
+        err(errors, nodePath, "\u5B57\u6BB5 title \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\uFF08\u6761\u6807\u9898\uFF09");
+      }
+      if (node.suffix !== void 0 && typeof node.suffix !== "string") {
+        err(errors, nodePath, "\u5B57\u6BB5 suffix \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\uFF08\u6761\u5E8F\u53F7\u540E\u7F00\uFF0C\u5982\u300C\u4E4B\u4E00\u300D\uFF09");
+      }
+      if (node.ordinal !== void 0 && typeof node.ordinal !== "number") {
+        err(errors, nodePath, "\u5B57\u6BB5 ordinal \u5FC5\u987B\u662F\u6570\u5B57\uFF08\u5BFC\u5165\u65F6\u4F1A\u6309\u7ED3\u6784\u4F4D\u7F6E\u91CD\u65B0\u7F16\u53F7\uFF09");
+      }
+      if (!Array.isArray(node.children)) {
+        err(errors, nodePath, `\u7F3A\u5C11\u5FC5\u9700\u5B57\u6BB5 children\uFF08\u5FC5\u987B\u662F\u6570\u7EC4\uFF1B${expectedKind === "item" ? "\u9879\u4E3A\u53F6\u5B50\u8282\u70B9\uFF0C\u5E94\u4E3A []" : "\u65E0\u4E0B\u7EA7\u8282\u70B9\u65F6\u4E5F\u5E94\u4E3A []"}\uFF09`);
+        return;
+      }
+      if (depth === 0 || depth === 1) {
+        walkLevel(node.children, `${nodePath}.children`, depth + 1);
+      } else {
+        node.children.forEach((child, ci) => {
+          const childPath = `${nodePath}.children[${ci}]`;
+          if (!isPlainNode(child)) {
+            err(errors, childPath, `\u8282\u70B9\u5FC5\u987B\u662F\u5BF9\u8C61\uFF0C\u5B9E\u9645\u4E3A ${child === null ? "null" : typeof child}`);
+            return;
+          }
+          const childKind = child.kind;
+          err(
+            errors,
+            childPath,
+            `\u5C42\u7EA7\u7C7B\u578B\u9519\u8BEF\uFF1A\u9879\uFF08item\uFF09\u4E3A\u53F6\u5B50\u8282\u70B9\uFF0C\u4E0D\u80FD\u518D\u5305\u542B\u4E0B\u7EA7\u8282\u70B9${typeof childKind === "string" ? `\uFF08\u53D1\u73B0 kind\u300C${childKind}\u300D\uFF09` : ""}`
+          );
+        });
+      }
+    });
+  };
+  walkLevel(root, "document.root", 0);
+  return errors.length === 0 ? { ok: true, errors: [], counts } : { ok: false, errors };
+}
+function pathLabel(parentPath, index) {
+  const depth = (parentPath.match(/\.children/g) ?? []).length;
+  const ordinal = index + 1;
+  if (depth === 0) return `\u7B2C ${ordinal} \u6761`;
+  if (depth === 1) return `\u8BE5\u6761\u7B2C ${ordinal} \u6B3E`;
+  return `\u8BE5\u6B3E\u7B2C ${ordinal} \u9879`;
+}
+function validateDocument(document) {
+  if (!isPlainNode(document)) {
+    return {
+      ok: false,
+      errors: [{ path: "document", message: "\u7F3A\u5C11 document\uFF1A\u5BFC\u5165\u5305\u5FC5\u987B\u5305\u542B document \u5BF9\u8C61" }]
+    };
+  }
+  const errors = [];
+  if (typeof document.title !== "string") {
+    err(errors, "document.title", "document.title \u5FC5\u987B\u662F\u5B57\u7B26\u4E32");
+  }
+  const tree = validateClauseTree(document.root);
+  if (!tree.ok) errors.push(...tree.errors);
+  if (errors.length > 0) return { ok: false, errors };
+  const validDoc = document;
+  return {
+    ok: true,
+    errors: [],
+    counts: tree.counts,
+    title: validDoc.title,
+    rootCount: validDoc.root.length
+  };
+}
+function firstErrorMessage(result) {
+  const first = result.errors[0];
+  return first ? `${first.path}\uFF1A${first.message}` : "\u6587\u6863\u7ED3\u6784\u4E0D\u5408\u6CD5";
+}
+
+// server/index.ts
 var here = path.dirname(fileURLToPath(import.meta.url));
 var PORT = Number(process.env.PORT ?? 3e3);
 var DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(process.env.HOME ?? process.cwd(), ".clause-reference-validator");
@@ -37,10 +165,10 @@ async function atomicWriteState(state) {
     await fh.close();
     fh = null;
     await fsp.rename(tmp, DATA_FILE);
-  } catch (err) {
+  } catch (err2) {
     if (fh) await fh.close().catch(() => void 0);
     await fsp.rm(tmp, { force: true }).catch(() => void 0);
-    throw err;
+    throw err2;
   }
 }
 var writeChain = Promise.resolve();
@@ -68,17 +196,22 @@ app.put("/api/state", async (req, res) => {
   try {
     await enqueueWrite(body);
     res.json({ ok: true, savedAt: Date.now() });
-  } catch (err) {
-    res.status(500).json({ error: `\u4FDD\u5B58\u5931\u8D25\uFF1A${err.message}` });
+  } catch (err2) {
+    res.status(500).json({ error: `\u4FDD\u5B58\u5931\u8D25\uFF1A${err2.message}` });
   }
 });
 app.post("/api/validate", (req, res) => {
   const bundle = req.body;
-  if (!bundle || !bundle.document || !Array.isArray(bundle.document.root)) {
+  if (!bundle || typeof bundle !== "object" || !("document" in bundle)) {
     res.status(400).json({ error: "\u5BFC\u5165\u6587\u4EF6\u7F3A\u5C11 document.root" });
     return;
   }
-  res.json({ ok: true, title: bundle.document.title, rootCount: bundle.document.root.length });
+  const result = validateDocument(bundle.document);
+  if (!result.ok) {
+    res.status(400).json({ error: `\u5BFC\u5165\u6587\u4EF6\u7ED3\u6784\u4E0D\u5408\u6CD5\uFF1A${firstErrorMessage(result)}` });
+    return;
+  }
+  res.json({ ok: true, title: result.title, rootCount: result.rootCount });
 });
 var distDir = path.resolve(here, "../dist");
 if (fs.existsSync(distDir)) {

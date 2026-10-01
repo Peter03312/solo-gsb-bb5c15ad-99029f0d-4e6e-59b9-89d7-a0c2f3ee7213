@@ -173,6 +173,132 @@ try {
     check('GET /api/health 返回服务名', data.ok === true && data.service === 'clause-reference-validator');
   }
 
+  // POST /api/validate：与页面 JSON 导入同一套结构规则，成功 / 失败响应结构保持不变
+  {
+    // 空 root 合法：200 { ok, title, rootCount }
+    const empty = await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ document: { id: 'd', title: '空文档', root: [] } }),
+    });
+    const emptyData = await empty.json();
+    check('validate 空 root 200 且 rootCount=0', empty.status === 200 &&
+      emptyData.ok === true && emptyData.title === '空文档' && emptyData.rootCount === 0,
+      JSON.stringify({ status: empty.status, emptyData }));
+
+    // 完整 条→款→项 合法，rootCount 为条数
+    const valid = await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        document: {
+          id: 'd', title: '完整文档',
+          root: [
+            { id: 'a1', kind: 'article', ordinal: 1, text: '条头', children: [
+              { id: 'p1', kind: 'paragraph', ordinal: 1, text: '款', children: [
+                { id: 'i1', kind: 'item', ordinal: 1, text: '项', children: [] },
+              ] },
+            ] },
+          ],
+        },
+      }),
+    });
+    const validData = await valid.json();
+    check('validate 完整三层 200 且 rootCount=1', valid.status === 200 &&
+      validData.ok === true && validData.rootCount === 1, JSON.stringify(validData));
+
+    // 缺 document / root：保持原有 400 文案
+    const missing = await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ foo: 1 }),
+    });
+    const missingData = await missing.json();
+    check('validate 缺 document 返回原结构 400', missing.status === 400 &&
+      missingData.error === '导入文件缺少 document.root', JSON.stringify(missingData));
+
+    // 两处条款共用节点 ID：400 { error } 且说明原因
+    const dup = await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        document: { title: '重复 ID', root: [
+          { id: 'dup', kind: 'article', ordinal: 1, text: '', children: [] },
+          { id: 'dup', kind: 'article', ordinal: 2, text: '', children: [] },
+        ] },
+      }),
+    });
+    const dupData = await dup.json();
+    check('validate 重复 ID 返回 400 且说明原因', dup.status === 400 &&
+      typeof dupData.error === 'string' && dupData.error.includes('重复'), JSON.stringify(dupData));
+
+    // 层级错位：条下直接挂款之外的节点
+    const wrongKind = await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        document: { title: '错位', root: [
+          { id: 'a1', kind: 'article', ordinal: 1, text: '', children: [
+            { id: 'x1', kind: 'item', ordinal: 1, text: '跨层项', children: [] },
+          ] },
+        ] },
+      }),
+    });
+    const wrongKindData = await wrongKind.json();
+    check('validate 层级错位返回 400', wrongKind.status === 400 &&
+      wrongKindData.error.includes('层级类型错误'), JSON.stringify(wrongKindData));
+
+    // 子节点缺 children（旧实现会在页面导入时抛错）：400 且明确原因，不 500
+    const noChildren = await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ document: { title: '缺 children', root: [
+        { id: 'a1', kind: 'article', ordinal: 1, text: '' },
+      ] } }),
+    });
+    const noChildrenData = await noChildren.json();
+    check('validate 缺 children 返回 400（不抛错）', noChildren.status === 400 &&
+      noChildrenData.error.includes('children'), JSON.stringify(noChildrenData));
+
+    // 项为非叶子：400
+    const nestedItem = await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ document: { title: '项下挂项', root: [
+        { id: 'a1', kind: 'article', ordinal: 1, text: '', children: [
+          { id: 'p1', kind: 'paragraph', ordinal: 1, text: '', children: [
+            { id: 'i1', kind: 'item', ordinal: 1, text: '', children: [
+              { id: 'i2', kind: 'item', ordinal: 1, text: '', children: [] },
+            ] },
+          ] },
+        ] },
+      ] } }),
+    });
+    const nestedItemData = await nestedItem.json();
+    check('validate 项为非叶子返回 400', nestedItem.status === 400 &&
+      nestedItemData.error.includes('叶子'), JSON.stringify(nestedItemData));
+
+    // validate 只校验不写文件：记录校验前后文件内容，失败请求不得改动已保存状态
+    const before = await fetch(`http://127.0.0.1:${PORT}/api/state`);
+    const beforeData = await before.json();
+    await fetch(`http://127.0.0.1:${PORT}/api/validate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ document: { title: '不应写入', root: [
+        { id: 'a1', kind: 'article', ordinal: 1, text: '', children: [
+          { id: 'p1', kind: 'paragraph', ordinal: 1, text: '', children: [
+            { id: 'i1', kind: 'item', ordinal: 1, text: '', children: [
+              { id: 'i2', kind: 'item', ordinal: 1, text: '', children: [] },
+            ] },
+          ] },
+        ] },
+      ] } }),
+    });
+    const after = await fetch(`http://127.0.0.1:${PORT}/api/state`);
+    const afterData = await after.json();
+    check('validate 不写状态文件', JSON.stringify(afterData.state) === JSON.stringify(beforeData.state));
+  }
+
   // 写入失败时保留原有完整文件，恢复后后续保存仍可继续
   {
     const good = stateWith('受保护版本', 99);

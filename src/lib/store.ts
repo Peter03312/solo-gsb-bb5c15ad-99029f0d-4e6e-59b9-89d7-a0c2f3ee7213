@@ -63,6 +63,7 @@ import {
   scanTerms,
 } from './terminology';
 import type { TermHit, TermRule } from '../../shared/model';
+import { firstErrorMessage, validateDocument, type NodeValidationIssue } from '../../shared/validation';
 import { sampleTermRules } from './sample';
 import { uid } from './uid';
 
@@ -589,12 +590,33 @@ export class AppStore {
     );
   }
 
-  importJson(bundle: ExportBundle | PersistedState): void {
+  /**
+   * 导入 JSON 导出包（或持久化形态 { doc, ... }）。
+   * 先按与 POST /api/validate 完全一致的规则校验 document：
+   * 条 → 款 → 项层级、必需字段（id / kind / text / children）、全树 ID 唯一性，空 root 合法。
+   * 任一不合格即整体拒绝：不触碰当前正文、审阅留痕（快照 / 基线 / 审签 / 例外 / 批注 / 规则）
+   * 与撤销历史，并返回全部不合格位置与原因，由调用方逐条展示。
+   * 合法包保留原节点 ID（引用与审签继续关联原节点）及全部附属记录。
+   */
+  importJson(bundle: ExportBundle | PersistedState): { ok: true } | { ok: false; errors: NodeValidationIssue[]; error: string } {
+    if (!bundle || typeof bundle !== 'object') {
+      const errors: NodeValidationIssue[] = [{ path: 'document', message: '导入内容不是有效的 JSON 对象' }];
+      return { ok: false, errors, error: firstErrorMessage({ ok: false, errors }) };
+    }
     const rawDoc = 'document' in bundle ? bundle.document : bundle.doc;
+    const validation = validateDocument(rawDoc);
+    if (!validation.ok) {
+      // 校验只读：当前正文、留痕与撤销历史保持原状
+      return {
+        ok: false,
+        errors: validation.errors,
+        error: firstErrorMessage(validation),
+      };
+    }
     const doc: ClauseDocument = {
-      id: rawDoc.id || uid('doc'),
+      id: (rawDoc as ClauseDocument).id || uid('doc'),
       title: typeof rawDoc.title === 'string' ? rawDoc.title : '未命名条款集',
-      root: Array.isArray(rawDoc.root) ? rawDoc.root : [],
+      root: rawDoc.root,
       updatedAt: Date.now(),
     };
     const confirmed = bundle.confirmed ?? {};
@@ -610,12 +632,14 @@ export class AppStore {
     const signoffs = sanitizeSignoffs(bundle.signoffs);
     // 例外处置记录随 JSON 导入；旧文件缺少 issueExceptions 时按空列表加载，三态按导入正文实时重算
     const issueExceptions = sanitizeIssueExceptions(bundle.issueExceptions);
+    // 节点 ID 全部原样保留（renumberAll 仅修正位置序号，不改 id），引用与审签继续关联原节点
     renumberAll(doc.root);
     // 导入包的整套状态作为新世界事务：撤销恢复导入前文档及其留痕，重做恢复导入后整套状态
     this.commitReplacement(
       { doc: touch(doc), confirmed, annotations, termRules },
       { snapshots, issueBaselines, signoffs, issueExceptions },
     );
+    return { ok: true };
   }
 
   exportJson(): ExportBundle {

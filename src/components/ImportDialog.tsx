@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import { useApp } from '../lib/context';
 import type { ExportBundle } from '../../shared/model';
+import { validateDocument } from '../../shared/validation';
 import { sampleDocument } from '../lib/sample';
 
 const PASTE_PLACEHOLDER = `示例法（节选）
@@ -21,6 +22,8 @@ export function ImportDialog({ onClose }: { onClose: () => void }) {
   const { store } = useApp();
   const [text, setText] = useState('');
   const [error, setError] = useState<string | null>(null);
+  /** 结构化校验失败时逐条列出的位置与原因 */
+  const [validationErrors, setValidationErrors] = useState<{ path: string; message: string }[]>([]);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const doPasteImport = () => {
@@ -34,17 +37,34 @@ export function ImportDialog({ onClose }: { onClose: () => void }) {
 
   const onFile = async (file: File) => {
     setError(null);
+    setValidationErrors([]);
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(await file.text()) as ExportBundle;
-      if (!parsed.document || !Array.isArray(parsed.document.root)) {
-        setError('JSON 结构不合法：缺少 document.root');
-        return;
-      }
-      store.importJson(parsed);
-      onClose();
+      parsed = JSON.parse(await file.text());
     } catch (e) {
       setError(`JSON 解析失败：${(e as Error).message}`);
+      return;
     }
+    // 与 POST /api/validate 同一套规则：条→款→项层级、必需字段、全树 ID 唯一性
+    const bundle = parsed as Partial<ExportBundle>;
+    if (!bundle || typeof bundle !== 'object' || !('document' in bundle)) {
+      setError('JSON 结构不合法：缺少 document.root');
+      return;
+    }
+    const result = validateDocument(bundle.document);
+    if (!result.ok) {
+      // 任一不合格即拒绝导入：当前正文、审阅留痕与撤销历史保持原状
+      setError(`JSON 结构不合法，共 ${result.errors.length} 项问题，已取消导入（当前文档未改动）：`);
+      setValidationErrors(result.errors);
+      return;
+    }
+    const imported = store.importJson(bundle as ExportBundle);
+    if (!imported.ok) {
+      setError(`${imported.error}，已取消导入（当前文档未改动）`);
+      setValidationErrors(imported.errors);
+      return;
+    }
+    onClose();
   };
 
   return (
@@ -67,6 +87,16 @@ export function ImportDialog({ onClose }: { onClose: () => void }) {
         />
 
         {error && <div className="form-error">{error}</div>}
+        {validationErrors.length > 0 && (
+          <ul className="validation-error-list">
+            {validationErrors.slice(0, 20).map((e, i) => (
+              <li key={`${e.path}-${i}`}>
+                <code>{e.path}</code>：{e.message}
+              </li>
+            ))}
+            {validationErrors.length > 20 && <li>…另有 {validationErrors.length - 20} 项问题未列出</li>}
+          </ul>
+        )}
 
         <div className="modal-actions">
           <label className="file-btn">
@@ -78,6 +108,8 @@ export function ImportDialog({ onClose }: { onClose: () => void }) {
               hidden
               onChange={(e) => {
                 const f = e.target.files?.[0];
+                // 允许修正后再次选择同一个文件
+                e.target.value = '';
                 if (f) void onFile(f);
               }}
             />

@@ -5,6 +5,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ExportBundle, PersistedState } from '../shared/model';
+import { firstErrorMessage, validateDocument } from '../shared/validation';
 
 // ESM 运行（tsx 开发 / esbuild 打包均为 ESM）
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -101,12 +102,21 @@ app.put('/api/state', async (req, res) => {
 });
 
 app.post('/api/validate', (req, res) => {
-  const bundle = req.body as ExportBundle;
-  if (!bundle || !bundle.document || !Array.isArray(bundle.document.root)) {
+  // 与页面「JSON 导入」共用 shared/validation 的同一套规则：
+  // 条 → 款 → 项层级、必需字段、全树 ID 唯一性；空 root 合法。
+  const bundle = req.body as Partial<ExportBundle> | null | undefined;
+  if (!bundle || typeof bundle !== 'object' || !('document' in bundle)) {
     res.status(400).json({ error: '导入文件缺少 document.root' });
     return;
   }
-  res.json({ ok: true, title: bundle.document.title, rootCount: bundle.document.root.length });
+  const result = validateDocument(bundle.document);
+  if (!result.ok) {
+    // 保持原有失败响应结构 { error: string }：给出首个不合格位置与原因
+    res.status(400).json({ error: `导入文件结构不合法：${firstErrorMessage(result)}` });
+    return;
+  }
+  // 成功响应结构保持 { ok, title, rootCount } 不变
+  res.json({ ok: true, title: result.title, rootCount: result.rootCount });
 });
 
 // 生产模式托管前端构建产物（dist-server/index.cjs → 同级 ../dist）
